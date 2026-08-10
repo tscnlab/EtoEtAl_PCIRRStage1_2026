@@ -1,0 +1,2 @@
+"all_conditions_pass","minimum_recovery_valid_rate","maximum_absolute_relative_bias","minimum_coverage","maximum_collapse_rate","median_interval_width_across_conditions","maximum_median_interval_width_ratio"
+TRUE,1,0.147362650225977,0.95,0,0.319579911644748,1.67283032724071

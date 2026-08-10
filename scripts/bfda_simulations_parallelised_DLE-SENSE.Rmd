@@ -1,0 +1,1293 @@
+---
+title: "Bayes factor design analysis for daytime mEDI"
+author: "Taisuke Eto"
+date: "2026-07-30"
+output: html_document
+---
+
+This script evaluates the planned sample size for the within-participant association between daytime melanopic EDI dose and melatonin suppression.
+It simulates data, fits the Full and Null models, calculates Bayes factors, checks model diagnostics, and assesses random-slope recovery.
+
+Daytime melanopic EDI dose is decomposed into:
+
+- `edi_within`: the session-specific deviation from each participant's mean
+- `edi_between`: the participant's mean exposure relative to the sample mean
+
+The two fitted models retain the same between-participant fixed effect and random-effects structure and differ only in the population-level within-participant effect:
+
+```text
+Full:
+y ~ edi_within + edi_between + (1 + edi_within | id)
+
+Null:
+y ~ edi_between + (1 + edi_within | id)
+```
+
+# 1. Load inputs and prepare the exposure predictor
+
+The simulation uses parameter combinations created by `informed_data_simulation_daytimeEDI_sep.Rmd` and observed daytime mEDI profiles to preserve a realistic exposure distribution.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r prepare-inputs}
+library(future)
+library(furrr)
+library(brms)
+library(bridgesampling)
+library(MASS)
+library(tidyverse)
+library(progressr)
+library(posterior)
+
+# Prevent additional threads from being created inside each worker.
+Sys.setenv(
+  OMP_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1"
+)
+
+# Reuse compiled Stan models when possible.
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores(logical = TRUE))
+
+parallelly::availableCores()
+
+informed_parameters <- read.csv("informed_parameters.csv") |>
+  dplyr::select(
+    intercept_mean,
+    within_slope_mean,
+    between_slope_mean
+  ) |>
+  distinct()
+
+# Parallelisation remains at the informed-parameter-row level.
+# Fewer workers are used automatically when the CSV contains fewer rows.
+
+workers <- min(
+  16,
+  nrow(informed_parameters),
+  max(1, parallel::detectCores(logical = TRUE) - 1)
+)
+
+plan(multisession, workers = workers)
+
+
+# Load the standardised log-transformed daytime mEDI dose data
+medi_dose_data <- read.csv("medi_data_log_transformed.csv") |>
+  filter(
+    is.finite(log_mean_dose)
+  )
+
+# Store each observed participant's exposure profile
+medi_values_by_participant <- medi_dose_data |>
+  group_by(Id) |>
+  summarise(
+    values = list(log_mean_dose),
+    .groups = "drop"
+  ) |>
+  filter(lengths(values) > 0) |>
+  pull(values)
+
+# Sample complete participant profiles and then perform
+# the within/between decomposition
+sample_medi_profile <- function(n_participants, n_sessions) {
+
+  donor_index <- sample.int(
+    length(medi_values_by_participant),
+    size = n_participants,
+    replace = TRUE
+  )
+
+  sampled_values <- purrr::map(
+    donor_index,
+    function(index) {
+
+      donor_values <- medi_values_by_participant[[index]]
+
+      donor_values[
+        sample.int(
+          length(donor_values),
+          size = n_sessions,
+          replace = length(donor_values) < n_sessions
+        )
+      ]
+    }
+  )
+
+  sampled_data <- tibble(
+    id = factor(
+      rep(seq_len(n_participants), each = n_sessions)
+    ),
+    session = rep(
+      seq_len(n_sessions),
+      times = n_participants
+    ),
+    edi_total = unlist(
+      sampled_values,
+      use.names = FALSE
+    )
+  ) |>
+    group_by(id) |>
+    mutate(
+      # Participant mean based on the three simulated sessions
+      edi_between_raw = mean(edi_total),
+
+      # Session-specific deviation from the participant mean
+      edi_within_raw = edi_total - edi_between_raw
+    ) |>
+    ungroup()
+
+  # Use one between-person value per participant when calculating its SD
+  between_values <- sampled_data |>
+    distinct(id, edi_between_raw) |>
+    pull(edi_between_raw)
+
+  between_mean <- mean(between_values)
+  between_sd <- sd(between_values)
+  within_sd <- sd(sampled_data$edi_within_raw)
+
+  if (
+    !is.finite(between_sd) ||
+    !is.finite(within_sd) ||
+    between_sd == 0 ||
+    within_sd == 0
+  ) {
+    stop(
+      "Unable to standardise the sampled within/between mEDI components."
+    )
+  }
+
+  sampled_data |>
+    mutate(
+      edi_between =
+        (edi_between_raw - between_mean) / between_sd,
+
+      edi_within =
+        edi_within_raw / within_sd,
+
+      id_numeric = as.integer(id)
+    )
+}
+
+
+
+test_predictor_data <- sample_medi_profile(
+  n_participants = 50,
+  n_sessions = 3
+)
+
+# Within-person means must be approximately zero
+test_predictor_data |>
+  group_by(id) |>
+  summarise(
+    mean_within = mean(edi_within),
+    .groups = "drop"
+  ) |>
+  summarise(
+    maximum_absolute_mean =
+      max(abs(mean_within))
+  )
+
+# Overall within component
+test_predictor_data |>
+  summarise(
+    within_mean = mean(edi_within),
+    within_sd = sd(edi_within)
+  )
+
+# Between component: one value per participant
+test_predictor_data |>
+  distinct(id, edi_between) |>
+  summarise(
+    between_mean = mean(edi_between),
+    between_sd = sd(edi_between)
+  )
+
+```
+
+# 2. Define simulation settings and priors
+
+The main settings include the sample size, number of sessions, generating standard deviations, Bayes-factor threshold, MCMC settings, and diagnostic criteria.
+
+```{r simulation-settings}
+# Fixed participant number, dictated by resource limitations
+n_ids <- 50
+
+# Number of observed melatonin suppression outcomes per participant
+n_sessions <- 3
+
+# Standard deviations used to generate the data
+intercept_sd <- 0.2
+slope_sd <- 0.2
+residual_sd <- 0.6
+
+# Correlation between participant-specific intercepts and slopes
+intercept_slope_cor <- 0
+
+# Number of the simulation
+num_simulations <- 100
+
+# Define threshold for Bayes Factor
+bf_threshold <- 10
+
+# brms sampling settings
+chains <- 4
+iter <- 4000
+warmup <- 1000
+
+# Refit a failed model once with a longer MCMC run.
+retry_failed_fits <- TRUE
+retry_iter <- 8000
+retry_warmup <- 2000
+
+# Model-diagnostic thresholds
+rhat_limit <- 1.01
+ess_limit <- 100 * chains
+bfmi_limit <- 0.30
+
+# Criteria for random-slope recovery with three observations per participant
+recovery_min_valid_rate <- 0.95
+recovery_max_abs_relative_bias <- 0.20
+recovery_min_coverage <- 0.90
+recovery_max_coverage <- 1.00
+recovery_max_collapse_rate <- 0.05
+recovery_max_median_interval_width_ratio <- 2.00
+
+# Treat an estimate below 25% of the true value as collapsed toward zero.
+slope_sd_collapse_threshold <- 0.25 * slope_sd
+
+# Proper priors are required for bridge sampling.
+full_priors <- c(
+  prior(
+    normal(0, 1),
+    class = "Intercept"
+  ),
+  prior(
+    student_t(1, 0, sqrt(2) / 4),
+    class = "b",
+    coef = "edi_within"
+  ),
+  prior(
+    student_t(1, 0, sqrt(2) / 4),
+    class = "b",
+    coef = "edi_between"
+  ),
+  prior(
+    student_t(3, 0, 0.5),
+    class = "sd"
+  ),
+  prior(
+    lkj(2),
+    class = "cor"
+  ),
+  prior(
+    student_t(3, 0, 0.5),
+    class = "sigma"
+  )
+)
+
+null_priors <- c(
+  prior(
+    normal(0, 1),
+    class = "Intercept"
+  ),
+  prior(
+    student_t(1, 0, sqrt(2) / 4),
+    class = "b",
+    coef = "edi_between"
+  ),
+  prior(
+    student_t(3, 0, 0.5),
+    class = "sd"
+  ),
+  prior(
+    lkj(2),
+    class = "cor"
+  ),
+  prior(
+    student_t(3, 0, 0.5),
+    class = "sigma"
+  )
+)
+
+# Random-intercept and random-slope covariance matrix
+random_effect_covariance <- matrix(
+  c(
+    intercept_sd^2,
+    intercept_slope_cor * intercept_sd * slope_sd,
+    intercept_slope_cor * intercept_sd * slope_sd,
+    slope_sd^2
+  ),
+  nrow = 2
+)
+
+```
+
+# 3. Define the model-diagnostic function
+
+This function checks HMC diagnostics, R-hat, effective sample size, and BFMI. 
+It also extracts the random-slope standard deviation for the recovery assessment.
+
+```{r diagnostic-function}
+
+diagnose_brms_fit <- function(
+    fit,
+    chains,
+    max_treedepth,
+    true_slope_sd,
+    slope_sd_collapse_threshold,
+    rhat_limit = 1.01,
+    ess_limit = 100 * chains,
+    bfmi_limit = 0.30
+) {
+
+  # HMC diagnostics
+  sampler_parameters <- rstan::get_sampler_params(
+    fit$fit,
+    inc_warmup = FALSE
+  )
+
+  n_divergent <- sum(
+    vapply(
+      sampler_parameters,
+      function(x) sum(x[, "divergent__"]),
+      numeric(1)
+    )
+  )
+
+  n_max_treedepth <- sum(
+    vapply(
+      sampler_parameters,
+      function(x) sum(x[, "treedepth__"] >= max_treedepth),
+      numeric(1)
+    )
+  )
+
+  bfmi_values <- rstan::get_bfmi(fit$fit)
+  min_bfmi <- min(bfmi_values)
+
+  # R-hat and ESS
+  posterior_draws <- posterior::as_draws_df(fit)
+
+  parameter_names <- posterior::variables(posterior_draws)
+
+  # Exclude Stan sampler variables such as lp__, energy__, etc.
+  model_parameter_names <- parameter_names[
+    grepl(
+      "^(b_|sd_|cor_|sigma$)",
+      parameter_names
+    )
+  ]
+
+  diagnostic_summary <- posterior::summarise_draws(
+    posterior::subset_draws(
+      posterior_draws,
+      variable = model_parameter_names
+    ),
+    "rhat",
+    "ess_bulk",
+    "ess_tail"
+  )
+
+  all_diagnostics_finite <-
+    all(is.finite(diagnostic_summary$rhat)) &&
+    all(is.finite(diagnostic_summary$ess_bulk)) &&
+    all(is.finite(diagnostic_summary$ess_tail))
+
+  max_rhat <- max(
+    diagnostic_summary$rhat,
+    na.rm = TRUE
+  )
+
+  min_bulk_ess <- min(
+    diagnostic_summary$ess_bulk,
+    na.rm = TRUE
+  )
+
+  min_tail_ess <- min(
+    diagnostic_summary$ess_tail,
+    na.rm = TRUE
+  )
+
+  # Random-slope SD posterior
+  slope_sd_draws <-
+    posterior_draws[["sd_id__edi_within"]]
+
+  estimated_slope_sd <- mean(slope_sd_draws)
+
+  median_estimated_slope_sd <- median(slope_sd_draws)
+
+  slope_sd_lower <- unname(
+    quantile(slope_sd_draws, 0.025)
+  )
+
+  slope_sd_upper <- unname(
+    quantile(slope_sd_draws, 0.975)
+  )
+
+  slope_sd_coverage <-
+    slope_sd_lower <= true_slope_sd &&
+    slope_sd_upper >= true_slope_sd
+
+  slope_sd_interval_width <-
+    slope_sd_upper - slope_sd_lower
+
+  slope_sd_error <-
+    estimated_slope_sd - true_slope_sd
+
+  slope_sd_collapsed <-
+    estimated_slope_sd < slope_sd_collapse_threshold
+
+  # Strict diagnostic pass
+  divergence_pass <-
+    n_divergent == 0
+  
+  rhat_pass <-
+    all_diagnostics_finite &&
+    max_rhat <= rhat_limit
+  
+  bulk_ess_pass <-
+    all_diagnostics_finite &&
+    min_bulk_ess >= ess_limit
+  
+  tail_ess_pass <-
+    all_diagnostics_finite &&
+    min_tail_ess >= ess_limit
+  
+  bfmi_pass <-
+    is.finite(min_bfmi) &&
+    min_bfmi >= bfmi_limit
+  
+  treedepth_pass <-
+    n_max_treedepth == 0
+  
+  diagnostic_pass <-
+    divergence_pass &&
+    rhat_pass &&
+    bulk_ess_pass &&
+    tail_ess_pass &&
+    bfmi_pass &&
+    treedepth_pass
+
+  tibble::tibble(
+    n_divergent = n_divergent,
+    n_max_treedepth = n_max_treedepth,
+    max_rhat = max_rhat,
+    min_bulk_ess = min_bulk_ess,
+    min_tail_ess = min_tail_ess,
+    min_bfmi = min_bfmi,
+    estimated_slope_sd = estimated_slope_sd,
+    median_estimated_slope_sd = median_estimated_slope_sd,
+    slope_sd_lower = slope_sd_lower,
+    slope_sd_upper = slope_sd_upper,
+    slope_sd_coverage = slope_sd_coverage,
+    slope_sd_interval_width = slope_sd_interval_width,
+    slope_sd_error = slope_sd_error,
+    slope_sd_squared_error = slope_sd_error^2,
+    slope_sd_collapsed = slope_sd_collapsed,
+    diagnostic_pass = diagnostic_pass,
+    divergence_pass = divergence_pass,
+    rhat_pass = rhat_pass,
+    bulk_ess_pass = bulk_ess_pass,
+    tail_ess_pass = tail_ess_pass,
+    bfmi_pass = bfmi_pass,
+    treedepth_pass = treedepth_pass
+  )
+}
+```
+
+# 4. Run the BFDA simulations
+
+For every simulated dataset, the full and null models are fitted with `brms`.
+Their marginal likelihoods are estimated by bridge sampling. 
+The resulting Bayes factor is \(BF_{10}\), in favour of the full model over the null model.
+
+```{r run-bfda}
+start_time <- Sys.time()
+
+handlers("progress")
+
+with_progress({
+
+  p <- progressor(steps = nrow(informed_parameters) * num_simulations)
+
+  bfda_simulated_data_parallel <- future_map_dfr(
+    1:nrow(informed_parameters),
+    function(row) {
+
+      bf_list <- rep(NA_real_, num_simulations)
+      log_bf_list <- rep(NA_real_, num_simulations)
+      beta_posterior_mean_list <- rep(NA_real_, num_simulations)
+      
+      full_diagnostic_list <- vector(
+        "list",
+        num_simulations
+      )
+      
+      null_diagnostic_list <- vector(
+        "list",
+        num_simulations
+      )
+      
+      bridge_logbf_difference_list <-
+        rep(NA_real_, num_simulations)
+      
+      bridge_decision_stable_list <-
+        rep(NA, num_simulations)
+
+      full_retry_list <- rep(FALSE, num_simulations)
+      null_retry_list <- rep(FALSE, num_simulations)
+      full_initial_diagnostic_pass_list <- rep(NA, num_simulations)
+      null_initial_diagnostic_pass_list <- rep(NA, num_simulations)
+      
+
+      # Each worker compiles the Full and Null models only on its first simulation. Later simulations reuse these compiled models.
+      fit_full <- NULL
+      fit_null <- NULL
+
+      for (simulation in seq_len(num_simulations)) {
+
+        # Participant-specific random intercepts and slopes
+        random_effects <- MASS::mvrnorm(
+          n = n_ids,
+          mu = c(0, 0),
+          Sigma = random_effect_covariance
+        )
+
+        random_intercept <- random_effects[, 1]
+        random_slope <- random_effects[, 2]
+
+        # Population-level data-generating parameters
+        intercept_mean <- 
+          informed_parameters$intercept_mean[row]
+        
+        within_slope_mean <-
+          informed_parameters$within_slope_mean[row]
+        
+        between_slope_mean <-
+          informed_parameters$between_slope_mean[row]
+        
+        # Sample participant exposure profiles and create within- and between-participant predictors
+        sim_data <- sample_medi_profile(
+          n_participants = n_ids,
+          n_sessions = n_sessions
+        )
+        
+        # Generate the standardised melatonin suppression outcome
+        sim_data$y <-
+          intercept_mean +
+          random_intercept[sim_data$id_numeric] +
+          between_slope_mean * sim_data$edi_between +
+          (
+            within_slope_mean +
+              random_slope[sim_data$id_numeric]
+          ) * sim_data$edi_within +
+          rnorm(
+            nrow(sim_data),
+            mean = 0,
+            sd = residual_sd
+          )
+
+        if (anyNA(sim_data)) {
+          stop(
+            sprintf(
+              "NA found in sim_data at row %d, simulation %d",
+              row,
+              simulation
+            )
+          )
+        }
+
+        if (is.null(fit_full)) {
+          fit_full <- brm(
+            y ~ edi_within + edi_between + 
+              (1 + edi_within | id),
+            data = sim_data,
+            family = gaussian(),
+            prior = full_priors,
+            backend = "rstan",
+            chains = chains,
+            cores = 1,
+            iter = iter,
+            warmup = warmup,
+            seed = 20260405 + row * 100000 + simulation,
+            save_pars = save_pars(all = TRUE),
+            control = list(
+              adapt_delta = 0.95,
+              max_treedepth = 12
+            ),
+            silent = 2,
+            refresh = 0
+          )
+        } else {
+          fit_full <- update(
+            fit_full,
+            newdata = sim_data,
+            recompile = FALSE,
+            chains = chains,
+            cores = 1,
+            iter = iter,
+            warmup = warmup,
+            seed = 20260405 + row * 100000 + simulation,
+            control = list(
+              adapt_delta = 0.95,
+              max_treedepth = 12
+            ),
+            silent = 2,
+            refresh = 0
+          )
+        }
+
+        if (is.null(fit_null)) {
+          fit_null <- brm(
+            y ~ edi_between + 
+              (1 + edi_within | id),
+            data = sim_data,
+            family = gaussian(),
+            prior = null_priors,
+            backend = "rstan",
+            chains = chains,
+            cores = 1,
+            iter = iter,
+            warmup = warmup,
+            seed = 30260405 + row * 100000 + simulation,
+            save_pars = save_pars(all = TRUE),
+            control = list(
+              adapt_delta = 0.95,
+              max_treedepth = 12
+            ),
+            silent = 2,
+            refresh = 0
+          )
+        } else {
+          fit_null <- update(
+            fit_null,
+            newdata = sim_data,
+            recompile = FALSE,
+            chains = chains,
+            cores = 1,
+            iter = iter,
+            warmup = warmup,
+            seed = 30260405 + row * 100000 + simulation,
+            control = list(
+              adapt_delta = 0.95,
+              max_treedepth = 12
+            ),
+            silent = 2,
+            refresh = 0
+          )
+        }
+
+        # Diagnose both fitted models
+        full_diagnostics <- diagnose_brms_fit(
+          fit = fit_full,
+          chains = chains,
+          max_treedepth = 12,
+          true_slope_sd = slope_sd,
+          slope_sd_collapse_threshold = slope_sd_collapse_threshold,
+          rhat_limit = rhat_limit,
+          ess_limit = ess_limit,
+          bfmi_limit = bfmi_limit
+        )
+        
+        null_diagnostics <- diagnose_brms_fit(
+          fit = fit_null,
+          chains = chains,
+          max_treedepth = 12,
+          true_slope_sd = slope_sd,
+          slope_sd_collapse_threshold = slope_sd_collapse_threshold,
+          rhat_limit = rhat_limit,
+          ess_limit = ess_limit,
+          bfmi_limit = bfmi_limit
+        )
+
+        full_initial_diagnostic_pass_list[simulation] <-
+          full_diagnostics$diagnostic_pass
+
+        null_initial_diagnostic_pass_list[simulation] <-
+          null_diagnostics$diagnostic_pass
+
+        # Retry failed models using the same simulated dataset.
+        if (
+          retry_failed_fits &&
+          !isTRUE(full_diagnostics$diagnostic_pass)
+        ) {
+          full_retry_list[simulation] <- TRUE
+
+          fit_full <- update(
+            fit_full,
+            newdata = sim_data,
+            recompile = FALSE,
+            chains = chains,
+            cores = 1,
+            iter = retry_iter,
+            warmup = retry_warmup,
+            seed = 40260405 + row * 100000 + simulation,
+            control = list(
+              adapt_delta = 0.95,
+              max_treedepth = 12
+            ),
+            silent = 2,
+            refresh = 0
+          )
+
+          full_diagnostics <- diagnose_brms_fit(
+            fit = fit_full,
+            chains = chains,
+            max_treedepth = 12,
+            true_slope_sd = slope_sd,
+            slope_sd_collapse_threshold = slope_sd_collapse_threshold,
+            rhat_limit = rhat_limit,
+            ess_limit = ess_limit,
+            bfmi_limit = bfmi_limit
+          )
+        }
+
+        if (
+          retry_failed_fits &&
+          !isTRUE(null_diagnostics$diagnostic_pass)
+        ) {
+          null_retry_list[simulation] <- TRUE
+
+          fit_null <- update(
+            fit_null,
+            newdata = sim_data,
+            recompile = FALSE,
+            chains = chains,
+            cores = 1,
+            iter = retry_iter,
+            warmup = retry_warmup,
+            seed = 50260405 + row * 100000 + simulation,
+            control = list(
+              adapt_delta = 0.95,
+              max_treedepth = 12
+            ),
+            silent = 2,
+            refresh = 0
+          )
+
+          null_diagnostics <- diagnose_brms_fit(
+            fit = fit_null,
+            chains = chains,
+            max_treedepth = 12,
+            true_slope_sd = slope_sd,
+            slope_sd_collapse_threshold = slope_sd_collapse_threshold,
+            rhat_limit = rhat_limit,
+            ess_limit = ess_limit,
+            bfmi_limit = bfmi_limit
+          )
+        }
+        
+        full_diagnostic_list[[simulation]] <-
+          full_diagnostics
+        
+        null_diagnostic_list[[simulation]] <-
+          null_diagnostics
+        
+        beta_posterior_mean_list[simulation] <-
+          brms::fixef(fit_full)["edi_within", "Estimate"]
+        
+        sampling_diagnostics_pass <-
+          full_diagnostics$diagnostic_pass &&
+          null_diagnostics$diagnostic_pass
+        
+        if (sampling_diagnostics_pass) {
+        
+          # Repeat bridge sampling to check numerical stability.
+          bridge_full_1 <- brms::bridge_sampler(
+            fit_full,
+            silent = TRUE
+          )
+        
+          bridge_null_1 <- brms::bridge_sampler(
+            fit_null,
+            silent = TRUE
+          )
+        
+          bridge_full_2 <- brms::bridge_sampler(
+            fit_full,
+            silent = TRUE
+          )
+        
+          bridge_null_2 <- brms::bridge_sampler(
+            fit_null,
+            silent = TRUE
+          )
+        
+          log_bf_1 <-
+            bridge_full_1$logml -
+            bridge_null_1$logml
+        
+          log_bf_2 <-
+            bridge_full_2$logml -
+            bridge_null_2$logml
+        
+          log_bf_list[simulation] <- log_bf_1
+          bf_list[simulation] <- exp(log_bf_1)
+        
+          bridge_logbf_difference_list[simulation] <-
+            abs(log_bf_1 - log_bf_2)
+        
+          # Does repetition change the BF >= 10 decision?
+          bridge_decision_stable_list[simulation] <-
+            is.finite(log_bf_1) &&
+            is.finite(log_bf_2) &&
+            (
+              (log_bf_1 >= log(bf_threshold)) ==
+                (log_bf_2 >= log(bf_threshold))
+            )
+        }
+
+        p(sprintf(
+          "row %d / %d, simulation %d/%d",
+          row,
+          nrow(informed_parameters),
+          simulation,
+          num_simulations
+        ))
+      }
+      
+      full_diagnostics_all <-
+        bind_rows(full_diagnostic_list)
+      
+      null_diagnostics_all <-
+        bind_rows(null_diagnostic_list)
+      
+      sampling_pass_list <-
+        full_diagnostics_all$diagnostic_pass &
+        null_diagnostics_all$diagnostic_pass
+      
+      valid_simulation_list <-
+        sampling_pass_list &
+        !is.na(bridge_decision_stable_list) &
+        bridge_decision_stable_list &
+        is.finite(log_bf_list) &
+        is.finite(beta_posterior_mean_list)
+      
+      valid_simulation_list[
+        is.na(valid_simulation_list)
+      ] <- FALSE
+      
+      strong_negative_evidence_list <-
+        valid_simulation_list &
+        log_bf_list >= log(bf_threshold) &
+        beta_posterior_mean_list < 0
+      
+      # Invalid simulations count as unsuccessful in the operational rate.
+      strong_negative_evidence_rate <-
+        mean(strong_negative_evidence_list)
+      
+      valid_simulation_rate <-
+        mean(valid_simulation_list)
+      
+      # Evidence rate among diagnostically valid simulations only
+      conditional_evidence_rate <-
+        if (sum(valid_simulation_list) > 0) {
+          mean(
+            log_bf_list[valid_simulation_list] >=
+              log(bf_threshold) &
+              beta_posterior_mean_list[
+                valid_simulation_list
+              ] < 0
+          )
+        } else {
+          NA_real_
+        }
+      
+      bridge_attempt_rate <-
+        mean(!is.na(bridge_decision_stable_list))
+      
+      bridge_decision_stable_rate <-
+        if (any(!is.na(bridge_decision_stable_list))) {
+          mean(
+            bridge_decision_stable_list,
+            na.rm = TRUE
+          )
+        } else {
+          NA_real_
+        }
+      
+      median_bridge_logbf_difference <-
+        if (any(is.finite(bridge_logbf_difference_list))) {
+          median(
+            bridge_logbf_difference_list,
+            na.rm = TRUE
+          )
+        } else {
+          NA_real_
+        }
+
+      # Evaluate recovery among diagnostically valid Full-model fits.
+      slope_recovery_diagnostics <-
+        full_diagnostics_all |>
+        filter(diagnostic_pass)
+
+      n_slope_recovery_valid <-
+        nrow(slope_recovery_diagnostics)
+
+      slope_recovery_valid_rate <-
+        n_slope_recovery_valid / num_simulations
+
+      if (n_slope_recovery_valid > 0) {
+        mean_estimated_slope_sd <- mean(
+          slope_recovery_diagnostics$estimated_slope_sd
+        )
+
+        median_estimated_slope_sd <- median(
+          slope_recovery_diagnostics$estimated_slope_sd
+        )
+
+        slope_sd_bias <-
+          mean_estimated_slope_sd - slope_sd
+
+        slope_sd_relative_bias <-
+          slope_sd_bias / slope_sd
+
+        slope_sd_rmse <- sqrt(
+          mean(
+            slope_recovery_diagnostics$slope_sd_squared_error
+          )
+        )
+
+        slope_sd_coverage <- mean(
+          slope_recovery_diagnostics$slope_sd_coverage
+        )
+
+        mean_slope_sd_interval_width <- mean(
+          slope_recovery_diagnostics$slope_sd_interval_width
+        )
+
+        median_slope_sd_interval_width <- median(
+          slope_recovery_diagnostics$slope_sd_interval_width
+        )
+
+        median_slope_sd_interval_width_ratio <-
+          median_slope_sd_interval_width / slope_sd
+
+        slope_sd_collapse_rate <- mean(
+          slope_recovery_diagnostics$slope_sd_collapsed
+        )
+      } else {
+        mean_estimated_slope_sd <- NA_real_
+        median_estimated_slope_sd <- NA_real_
+        slope_sd_bias <- NA_real_
+        slope_sd_relative_bias <- NA_real_
+        slope_sd_rmse <- NA_real_
+        slope_sd_coverage <- NA_real_
+        mean_slope_sd_interval_width <- NA_real_
+        median_slope_sd_interval_width <- NA_real_
+        median_slope_sd_interval_width_ratio <- NA_real_
+        slope_sd_collapse_rate <- NA_real_
+      }
+
+      random_slope_recovery_pass <-
+        is.finite(slope_recovery_valid_rate) &&
+        is.finite(slope_sd_relative_bias) &&
+        is.finite(slope_sd_coverage) &&
+        is.finite(median_slope_sd_interval_width_ratio) &&
+        is.finite(slope_sd_collapse_rate) &&
+        slope_recovery_valid_rate >= recovery_min_valid_rate &&
+        abs(slope_sd_relative_bias) <=
+          recovery_max_abs_relative_bias &&
+        slope_sd_coverage >= recovery_min_coverage &&
+        slope_sd_coverage <= recovery_max_coverage &&
+        median_slope_sd_interval_width_ratio <=
+          recovery_max_median_interval_width_ratio &&
+        slope_sd_collapse_rate <= recovery_max_collapse_rate
+
+      full_retry_rescue_rate <-
+        if (sum(full_retry_list) > 0) {
+          mean(
+            full_diagnostics_all$diagnostic_pass[
+              full_retry_list
+            ]
+          )
+        } else {
+          NA_real_
+        }
+
+      null_retry_rescue_rate <-
+        if (sum(null_retry_list) > 0) {
+          mean(
+            null_diagnostics_all$diagnostic_pass[
+              null_retry_list
+            ]
+          )
+        } else {
+          NA_real_
+        }
+      
+        true_within_slope <-
+          informed_parameters$within_slope_mean[row]
+        
+        tibble::tibble(
+          intercept_mean =
+            informed_parameters$intercept_mean[row],
+        
+          within_slope_mean =
+            true_within_slope,
+        
+          between_slope_mean =
+            informed_parameters$between_slope_mean[row],
+        
+          strong_negative_evidence_rate =
+            strong_negative_evidence_rate,
+        
+          conditional_evidence_rate =
+            conditional_evidence_rate,
+        
+          valid_simulation_rate =
+            valid_simulation_rate,
+        
+          full_diagnostic_pass_rate =
+            mean(full_diagnostics_all$diagnostic_pass),
+
+          full_initial_diagnostic_pass_rate =
+            mean(full_initial_diagnostic_pass_list),
+
+          full_retry_rate =
+            mean(full_retry_list),
+
+          full_retry_rescue_rate =
+            full_retry_rescue_rate,
+        
+          null_diagnostic_pass_rate =
+            mean(null_diagnostics_all$diagnostic_pass),
+
+          null_initial_diagnostic_pass_rate =
+            mean(null_initial_diagnostic_pass_list),
+
+          null_retry_rate =
+            mean(null_retry_list),
+
+          null_retry_rescue_rate =
+            null_retry_rescue_rate,
+        
+          median_bridge_logbf_difference =
+            median_bridge_logbf_difference,
+        
+          mean_estimated_slope_sd =
+            mean_estimated_slope_sd,
+
+          median_estimated_slope_sd =
+            median_estimated_slope_sd,
+        
+          slope_sd_bias =
+            slope_sd_bias,
+
+          slope_sd_relative_bias =
+            slope_sd_relative_bias,
+
+          slope_sd_rmse =
+            slope_sd_rmse,
+        
+          slope_sd_coverage =
+            slope_sd_coverage,
+
+          mean_slope_sd_interval_width =
+            mean_slope_sd_interval_width,
+
+          median_slope_sd_interval_width =
+            median_slope_sd_interval_width,
+
+          median_slope_sd_interval_width_ratio =
+            median_slope_sd_interval_width_ratio,
+
+          slope_sd_collapse_threshold =
+            slope_sd_collapse_threshold,
+
+          slope_sd_collapse_rate =
+            slope_sd_collapse_rate,
+
+          slope_recovery_valid_rate =
+            slope_recovery_valid_rate,
+
+          random_slope_recovery_pass =
+            random_slope_recovery_pass,
+        
+          total_divergences =
+            sum(
+              full_diagnostics_all$n_divergent,
+              null_diagnostics_all$n_divergent
+            ),
+        
+          TPR = ifelse(
+            true_within_slope < 0,
+            strong_negative_evidence_rate,
+            NA_real_
+          ),
+        
+          FPR = ifelse(
+            true_within_slope == 0,
+            strong_negative_evidence_rate,
+            NA_real_
+          ),
+          
+          full_divergence_pass_rate =
+            mean(full_diagnostics_all$divergence_pass),
+          
+          full_rhat_pass_rate =
+            mean(full_diagnostics_all$rhat_pass),
+          
+          full_bulk_ess_pass_rate =
+            mean(full_diagnostics_all$bulk_ess_pass),
+          
+          full_tail_ess_pass_rate =
+            mean(full_diagnostics_all$tail_ess_pass),
+          
+          full_bfmi_pass_rate =
+            mean(full_diagnostics_all$bfmi_pass),
+          
+          full_treedepth_pass_rate =
+            mean(full_diagnostics_all$treedepth_pass),
+          
+          null_divergence_pass_rate =
+            mean(null_diagnostics_all$divergence_pass),
+          
+          null_rhat_pass_rate =
+            mean(null_diagnostics_all$rhat_pass),
+          
+          null_bulk_ess_pass_rate =
+            mean(null_diagnostics_all$bulk_ess_pass),
+          
+          null_tail_ess_pass_rate =
+            mean(null_diagnostics_all$tail_ess_pass),
+          
+          null_bfmi_pass_rate =
+            mean(null_diagnostics_all$bfmi_pass),
+          
+          null_treedepth_pass_rate =
+            mean(null_diagnostics_all$treedepth_pass),
+          
+          bridge_attempt_rate =
+            bridge_attempt_rate,
+          
+          bridge_decision_stable_rate =
+            bridge_decision_stable_rate
+        )
+    },
+    .options = furrr_options(
+      seed = 20260405,
+      packages = c(
+        "brms",
+        "bridgesampling",
+        "MASS",
+        "dplyr",
+        "tibble"
+      )
+    )
+  )
+})
+
+head(bfda_simulated_data_parallel)
+
+# Summarise retries and random-slope recovery by generating condition.
+bfda_simulated_data_parallel |>
+  select(
+    within_slope_mean,
+    null_initial_diagnostic_pass_rate,
+    null_retry_rate,
+    null_retry_rescue_rate,
+    null_diagnostic_pass_rate,
+    slope_recovery_valid_rate,
+    mean_estimated_slope_sd,
+    slope_sd_relative_bias,
+    slope_sd_rmse,
+    slope_sd_coverage,
+    median_slope_sd_interval_width,
+    median_slope_sd_interval_width_ratio,
+    slope_sd_collapse_rate,
+    random_slope_recovery_pass
+  ) |>
+  arrange(within_slope_mean)
+
+# Summarise whether recovery criteria pass across all conditions.
+three_session_random_slope_assessment <-
+  bfda_simulated_data_parallel |>
+  summarise(
+    all_conditions_pass =
+      all(random_slope_recovery_pass),
+    minimum_recovery_valid_rate =
+      min(slope_recovery_valid_rate),
+    maximum_absolute_relative_bias =
+      max(abs(slope_sd_relative_bias)),
+    minimum_coverage =
+      min(slope_sd_coverage),
+    maximum_collapse_rate =
+      max(slope_sd_collapse_rate),
+    median_interval_width_across_conditions =
+      median(median_slope_sd_interval_width),
+    maximum_median_interval_width_ratio =
+      max(median_slope_sd_interval_width_ratio)
+  )
+
+three_session_random_slope_assessment
+
+end_time <- Sys.time()
+start_time
+end_time - start_time
+```
+
+The main output columns are:
+
+- `null_initial_diagnostic_pass_rate` is the success rate with the original 4,000-iteration setting.
+- `null_retry_rate` is the proportion that required the longer 8,000-iteration refit.
+- `null_retry_rescue_rate` is the proportion of retried Null fits that passed after the longer run.
+- `null_diagnostic_pass_rate` is the final rate after retry and is the rate used for the Bayes-factor analysis.
+- `random_slope_recovery_pass` evaluates the three-observation design for each population-slope condition using the pre-specified valid-fit, relative-bias, coverage, interval-width, and near-zero-collapse criteria.
+- `all_conditions_pass` is `TRUE` only when random-slope recovery passes under every simulated population-slope condition. The component metrics should be reported alongside this binary summary.
+
+# 5. Save results
+
+```{r save-results}
+dir.create(
+  "results",
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+write.csv(
+  bfda_simulated_data_parallel,
+  sprintf(
+    "results/bfda_simulated_data_parallel_brms_resid_%s_nsim_%d.csv",
+    format(residual_sd, trim = TRUE),
+    num_simulations
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  three_session_random_slope_assessment,
+  "results/three_session_random_slope_assessment.csv",
+  row.names = FALSE
+)
+```
+
+# 6. Plot the evidence rate
+
+```{r plot-evidence-rate}
+ggplot(
+  bfda_simulated_data_parallel,
+  aes(
+    x = within_slope_mean,
+    y = strong_negative_evidence_rate,
+    group = factor(intercept_mean),
+    colour = factor(intercept_mean)
+  )
+) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "True positive rate (TPR) for the within-participant daytime mEDI effect",
+    x = "Population within-participant mEDI slope",
+    y = "TPR",
+    colour = "Intercept mean"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+```

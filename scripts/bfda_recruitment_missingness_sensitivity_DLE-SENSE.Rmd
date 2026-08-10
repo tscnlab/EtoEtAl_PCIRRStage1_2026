@@ -1,0 +1,519 @@
+---
+title: "BFDA recruitment and incomplete-data sensitivity analysis"
+author: "Taisuke Eto"
+date: "2026-08-07"
+output: html_document
+---
+
+This script evaluates the planned recruitment rule under incomplete data. 
+The simulation stops when either 50 participants have three valid observations or 60 participants have been enrolled.
+
+Participants with two valid observations are retained in CH1. 
+Those with fewer than two are excluded before the within- and between-person decomposition. 
+The stopping rule is based only on data completeness.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Packages and analysis settings
+
+```{r packages-and-settings}
+library(future)
+library(furrr)
+library(brms)
+library(bridgesampling)
+library(MASS)
+library(tidyverse)
+library(progressr)
+library(posterior)
+
+Sys.setenv(
+  OMP_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1"
+)
+rstan::rstan_options(auto_write = TRUE)
+
+# Recruitment settings
+target_complete <- 50
+maximum_enrolment <- 60
+
+# Effect conditions
+within_slopes <- c(-0.3, 0)
+intercept_mean <- 0
+between_slope_mean <- 0
+
+# Completeness scenarios: probabilities for three, two, or one valid observation
+completeness_scenarios <- list(
+  high = c(`3` = 0.90, `2` = 0.07, `1` = 0.03),
+  expected = c(`3` = 0.85, `2` = 0.10, `1` = 0.05),
+  stress = c(`3` = 0.70, `2` = 0.20, `1` = 0.10)
+)
+
+num_simulations <- 100  # use a small value for testing
+bf_threshold <- 10
+
+intercept_sd <- 0.2
+slope_sd <- 0.2
+residual_sd <- 0.6
+intercept_slope_cor <- 0
+
+chains <- 4
+iter <- 4000
+warmup <- 1000
+retry_failed_fits <- TRUE
+retry_iter <- 8000
+retry_warmup <- 2000
+
+rhat_limit <- 1.01
+ess_limit <- 100 * chains
+bfmi_limit <- 0.30
+max_treedepth <- 12
+
+workers <- min(
+  16,
+  length(within_slopes) * length(completeness_scenarios),
+  max(1, parallel::detectCores(logical = TRUE) - 1)
+)
+plan(multisession, workers = workers)
+```
+
+# 2. Predictor data and simulation conditions
+
+Observed mEDI profiles are used as the source distribution for the simulated predictor values.
+
+```{r predictor-data-and-design-grid}
+medi_dose_data <- read.csv("medi_data_standardised.csv") |>
+  filter(is.finite(log_mean_dose_standardised))
+
+medi_values_by_participant <- medi_dose_data |>
+  group_by(Id) |>
+  summarise(values = list(log_mean_dose_standardised), .groups = "drop") |>
+  filter(lengths(values) > 0) |>
+  pull(values)
+
+stopifnot(length(medi_values_by_participant) > 0)
+
+normalise_probabilities <- function(probabilities) {
+  stopifnot(
+    !is.null(names(probabilities)),
+    all(names(probabilities) %in% c("0", "1", "2", "3")),
+    all(is.finite(probabilities)),
+    all(probabilities >= 0),
+    sum(probabilities) > 0
+  )
+  probabilities / sum(probabilities)
+}
+
+design_grid <- tidyr::crossing(
+  scenario = names(completeness_scenarios),
+  within_slope_mean = within_slopes
+) |>
+  mutate(
+    intercept_mean = intercept_mean,
+    between_slope_mean = between_slope_mean
+  )
+
+# Apply the recruitment stopping rule.
+simulate_recruitment <- function(probabilities) {
+  probabilities <- normalise_probabilities(probabilities)
+  valid_n <- integer(maximum_enrolment)
+  enrolled_n <- 0
+  complete_n <- 0
+
+  while (
+    enrolled_n < maximum_enrolment &&
+    complete_n < target_complete
+  ) {
+    enrolled_n <- enrolled_n + 1
+    valid_n[enrolled_n] <- sample(
+      as.integer(names(probabilities)),
+      size = 1,
+      prob = probabilities
+    )
+    complete_n <- complete_n + (valid_n[enrolled_n] == 3)
+  }
+
+  tibble(
+    enrolled_id = seq_len(enrolled_n),
+    n_valid = valid_n[seq_len(enrolled_n)]
+  )
+}
+
+# Sample valid sessions and calculate the within- and between-person components.
+sample_incomplete_medi_profile <- function(recruitment) {
+  analysis_participants <- recruitment |>
+    filter(n_valid >= 2) |>
+    mutate(id = factor(row_number()))
+
+  if (nrow(analysis_participants) < 2) {
+    stop("Too few participants with at least two valid observations.")
+  }
+
+  sampled <- purrr::pmap_dfr(
+    analysis_participants,
+    function(enrolled_id, n_valid, id) {
+      donor_values <- medi_values_by_participant[[
+        sample.int(length(medi_values_by_participant), 1)
+      ]]
+      tibble(
+        enrolled_id = enrolled_id,
+        id = factor(id, levels = levels(analysis_participants$id)),
+        session = seq_len(n_valid),
+        edi_total = sample(
+          donor_values,
+          size = n_valid,
+          replace = length(donor_values) < n_valid
+        )
+      )
+    }
+  ) |>
+    group_by(id) |>
+    mutate(
+      edi_between_raw = mean(edi_total),
+      edi_within_raw = edi_total - edi_between_raw
+    ) |>
+    ungroup()
+
+  between_values <- sampled |>
+    distinct(id, edi_between_raw) |>
+    pull(edi_between_raw)
+
+  between_mean <- mean(between_values)
+  between_sd <- sd(between_values)
+  within_sd <- sd(sampled$edi_within_raw)
+
+  if (!all(is.finite(c(between_sd, within_sd))) ||
+      between_sd == 0 || within_sd == 0) {
+    stop("Unable to standardise simulated mEDI components.")
+  }
+
+  sampled |>
+    mutate(
+      edi_between = (edi_between_raw - between_mean) / between_sd,
+      edi_within = edi_within_raw / within_sd,
+      id_numeric = as.integer(id)
+    )
+}
+```
+
+# 3. Priors and model diagnostics
+
+The Full model includes the population-level within-person effect; the Null model omits this effect while retaining the same random-effects structure.
+
+```{r priors-and-diagnostics}
+full_priors <- c(
+  prior(normal(0, 1), class = "Intercept"),
+  prior(student_t(1, 0, sqrt(2) / 4), class = "b", coef = "edi_within"),
+  prior(student_t(1, 0, sqrt(2) / 4), class = "b", coef = "edi_between"),
+  prior(student_t(3, 0, 0.5), class = "sd"),
+  prior(lkj(2), class = "cor"),
+  prior(student_t(3, 0, 0.5), class = "sigma")
+)
+
+null_priors <- c(
+  prior(normal(0, 1), class = "Intercept"),
+  prior(student_t(1, 0, sqrt(2) / 4), class = "b", coef = "edi_between"),
+  prior(student_t(3, 0, 0.5), class = "sd"),
+  prior(lkj(2), class = "cor"),
+  prior(student_t(3, 0, 0.5), class = "sigma")
+)
+
+random_effect_covariance <- matrix(
+  c(
+    intercept_sd^2,
+    intercept_slope_cor * intercept_sd * slope_sd,
+    intercept_slope_cor * intercept_sd * slope_sd,
+    slope_sd^2
+  ),
+  nrow = 2
+)
+
+diagnose_fit <- function(fit) {
+  sampler <- rstan::get_sampler_params(fit$fit, inc_warmup = FALSE)
+  n_divergent <- sum(vapply(sampler, function(x) sum(x[, "divergent__"]), numeric(1)))
+  n_treedepth <- sum(vapply(sampler, function(x) sum(x[, "treedepth__"] >= max_treedepth), numeric(1)))
+  min_bfmi <- min(rstan::get_bfmi(fit$fit))
+
+  draws <- posterior::as_draws_df(fit)
+  variables <- posterior::variables(draws)
+  variables <- variables[grepl("^(b_|sd_|cor_|sigma$)", variables)]
+  diagnostics <- posterior::summarise_draws(
+    posterior::subset_draws(draws, variable = variables),
+    "rhat", "ess_bulk", "ess_tail"
+  )
+
+  finite <- all(is.finite(diagnostics$rhat)) &&
+    all(is.finite(diagnostics$ess_bulk)) &&
+    all(is.finite(diagnostics$ess_tail))
+
+  slope_draws <- draws[["sd_id__edi_within"]]
+  slope_lower <- unname(quantile(slope_draws, 0.025))
+  slope_upper <- unname(quantile(slope_draws, 0.975))
+
+  tibble(
+    diagnostic_pass = finite && n_divergent == 0 && n_treedepth == 0 &&
+      max(diagnostics$rhat) <= rhat_limit &&
+      min(diagnostics$ess_bulk) >= ess_limit &&
+      min(diagnostics$ess_tail) >= ess_limit &&
+      is.finite(min_bfmi) && min_bfmi >= bfmi_limit,
+    n_divergent = n_divergent,
+    n_max_treedepth = n_treedepth,
+    max_rhat = max(diagnostics$rhat),
+    min_bulk_ess = min(diagnostics$ess_bulk),
+    min_tail_ess = min(diagnostics$ess_tail),
+    min_bfmi = min_bfmi,
+    estimated_slope_sd = mean(slope_draws),
+    slope_sd_coverage = slope_lower <= slope_sd && slope_upper >= slope_sd,
+    slope_sd_interval_width = slope_upper - slope_lower
+  )
+}
+
+fit_or_update <- function(previous_fit, formula, priors, data, seed, iterations, warmup_n) {
+  if (is.null(previous_fit)) {
+    brm(
+      formula, data = data, family = gaussian(), prior = priors,
+      backend = "rstan", chains = chains, cores = 1,
+      iter = iterations, warmup = warmup_n, seed = seed,
+      save_pars = save_pars(all = TRUE),
+      control = list(adapt_delta = 0.95, max_treedepth = max_treedepth),
+      silent = 2, refresh = 0
+    )
+  } else {
+    update(
+      previous_fit, newdata = data, recompile = FALSE,
+      chains = chains, cores = 1, iter = iterations, warmup = warmup_n,
+      seed = seed,
+      control = list(adapt_delta = 0.95, max_treedepth = max_treedepth),
+      silent = 2, refresh = 0
+    )
+  }
+}
+```
+
+# 4. Recruitment and BFDA simulations
+
+For each condition, the script simulates recruitment, generates the outcome, fits the Full and Null models, checks model diagnostics, and calculates the Bayes factor. 
+Failed fits are retried with additional iterations.
+
+```{r run-simulations}
+handlers("progress")
+start_time <- Sys.time()
+
+with_progress({
+  p <- progressor(steps = nrow(design_grid) * num_simulations)
+
+  simulation_level_results <- future_map_dfr(
+    seq_len(nrow(design_grid)),
+    function(grid_row) {
+      condition <- design_grid[grid_row, ]
+      probabilities <- completeness_scenarios[[condition$scenario]]
+      # Reuse compiled models within each condition.
+      fit_cache <- new.env(parent = emptyenv())
+      fit_cache$full <- NULL
+      fit_cache$null <- NULL
+
+      map_dfr(seq_len(num_simulations), function(simulation) {
+        recruitment <- simulate_recruitment(probabilities)
+        sim_data <- sample_incomplete_medi_profile(recruitment)
+        n_analysis <- n_distinct(sim_data$id)
+
+        random_effects <- MASS::mvrnorm(
+          n = n_analysis,
+          mu = c(0, 0),
+          Sigma = random_effect_covariance
+        )
+
+        sim_data <- sim_data |>
+          mutate(
+            y = condition$intercept_mean +
+              random_effects[id_numeric, 1] +
+              condition$between_slope_mean * edi_between +
+              (condition$within_slope_mean + random_effects[id_numeric, 2]) * edi_within +
+              rnorm(n(), 0, residual_sd)
+          )
+
+        base_seed <- 20260807L + grid_row * 100000L + simulation
+        fit_cache$full <- fit_or_update(
+          fit_cache$full,
+          y ~ edi_within + edi_between + (1 + edi_within | id),
+          full_priors, sim_data, base_seed, iter, warmup
+        )
+        fit_cache$null <- fit_or_update(
+          fit_cache$null,
+          y ~ edi_between + (1 + edi_within | id),
+          null_priors, sim_data, base_seed + 10000000L, iter, warmup
+        )
+
+        full_diag <- diagnose_fit(fit_cache$full)
+        null_diag <- diagnose_fit(fit_cache$null)
+        full_retry <- FALSE
+        null_retry <- FALSE
+
+        if (retry_failed_fits && !isTRUE(full_diag$diagnostic_pass)) {
+          full_retry <- TRUE
+          fit_cache$full <- fit_or_update(
+            fit_cache$full,
+            y ~ edi_within + edi_between + (1 + edi_within | id),
+            full_priors, sim_data, base_seed + 20000000L,
+            retry_iter, retry_warmup
+          )
+          full_diag <- diagnose_fit(fit_cache$full)
+        }
+        if (retry_failed_fits && !isTRUE(null_diag$diagnostic_pass)) {
+          null_retry <- TRUE
+          fit_cache$null <- fit_or_update(
+            fit_cache$null,
+            y ~ edi_between + (1 + edi_within | id),
+            null_priors, sim_data, base_seed + 30000000L,
+            retry_iter, retry_warmup
+          )
+          null_diag <- diagnose_fit(fit_cache$null)
+        }
+
+        diagnostics_pass <- full_diag$diagnostic_pass && null_diag$diagnostic_pass
+        log_bf_1 <- log_bf_2 <- NA_real_
+
+        # Evaluate recovery of the population-level within-person slope.
+        full_draws <- posterior::as_draws_df(fit_cache$full)
+        beta_draws <- full_draws[["b_edi_within"]]
+        beta_mean <- mean(beta_draws)
+        beta_lower <- unname(quantile(beta_draws, 0.025))
+        beta_upper <- unname(quantile(beta_draws, 0.975))
+        beta_error <- beta_mean - condition$within_slope_mean
+        beta_squared_error <- beta_error^2
+        beta_coverage <-
+          beta_lower <= condition$within_slope_mean &&
+          beta_upper >= condition$within_slope_mean
+        beta_interval_width <- beta_upper - beta_lower
+
+        if (diagnostics_pass) {
+          full_bridge_1 <- brms::bridge_sampler(fit_cache$full, silent = TRUE)
+          null_bridge_1 <- brms::bridge_sampler(fit_cache$null, silent = TRUE)
+          full_bridge_2 <- brms::bridge_sampler(fit_cache$full, silent = TRUE)
+          null_bridge_2 <- brms::bridge_sampler(fit_cache$null, silent = TRUE)
+          log_bf_1 <- full_bridge_1$logml - null_bridge_1$logml
+          log_bf_2 <- full_bridge_2$logml - null_bridge_2$logml
+        }
+
+        bridge_stable <- is.finite(log_bf_1) && is.finite(log_bf_2) &&
+          ((log_bf_1 >= log(bf_threshold)) == (log_bf_2 >= log(bf_threshold)))
+        valid <- diagnostics_pass && bridge_stable && is.finite(beta_mean)
+        success <- valid && log_bf_1 >= log(bf_threshold) && beta_mean < 0
+
+        p(sprintf("condition %d/%d, simulation %d/%d", grid_row, nrow(design_grid), simulation, num_simulations))
+
+        tibble(
+          scenario = condition$scenario,
+          within_slope_mean = condition$within_slope_mean,
+          simulation = simulation,
+          enrolled_n = nrow(recruitment),
+          target_complete_reached = sum(recruitment$n_valid == 3) >= target_complete,
+          complete_n = sum(recruitment$n_valid == 3),
+          two_observation_n = sum(recruitment$n_valid == 2),
+          one_or_zero_observation_n = sum(recruitment$n_valid < 2),
+          analysis_n = n_analysis,
+          total_observations = nrow(sim_data),
+          beta_posterior_mean = beta_mean,
+          beta_lower_95 = beta_lower,
+          beta_upper_95 = beta_upper,
+          beta_error = beta_error,
+          beta_squared_error = beta_squared_error,
+          beta_coverage_95 = beta_coverage,
+          beta_interval_width_95 = beta_interval_width,
+          log_bf = log_bf_1,
+          bridge_logbf_difference = abs(log_bf_1 - log_bf_2),
+          bridge_decision_stable = bridge_stable,
+          full_diagnostic_pass = full_diag$diagnostic_pass,
+          null_diagnostic_pass = null_diag$diagnostic_pass,
+          full_retry = full_retry,
+          null_retry = null_retry,
+          valid_simulation = valid,
+          strong_negative_evidence = success,
+          estimated_slope_sd = full_diag$estimated_slope_sd,
+          slope_sd_coverage = full_diag$slope_sd_coverage,
+          slope_sd_interval_width = full_diag$slope_sd_interval_width
+        )
+      })
+    },
+    .options = furrr_options(
+      seed = 20260807,
+      packages = c("brms", "bridgesampling", "MASS", "tidyverse", "posterior")
+    )
+  )
+})
+
+end_time <- Sys.time()
+end_time - start_time
+```
+
+# 5. Summarise and save results
+
+Two files are saved: simulation-level results and a summary for each completeness and effect condition.
+
+```{r summarise-and-save}
+condition_summary <- simulation_level_results |>
+  group_by(scenario, within_slope_mean) |>
+  summarise(
+    simulations = n(),
+    target_complete_reached_rate = mean(target_complete_reached),
+    median_enrolled_n = median(enrolled_n),
+    median_complete_n = median(complete_n),
+    median_analysis_n = median(analysis_n),
+    median_total_observations = median(total_observations),
+    valid_simulation_rate = mean(valid_simulation),
+    full_diagnostic_pass_rate = mean(full_diagnostic_pass),
+    null_diagnostic_pass_rate = mean(null_diagnostic_pass),
+    bridge_decision_stable_rate = mean(bridge_decision_stable, na.rm = TRUE),
+    median_bridge_logbf_difference = median(bridge_logbf_difference, na.rm = TRUE),
+    strong_negative_evidence_rate = mean(strong_negative_evidence),
+    # Evaluate slope recovery among Full models that pass diagnostics.
+    mean_beta_estimate = mean(beta_posterior_mean[full_diagnostic_pass]),
+    beta_bias = mean(beta_error[full_diagnostic_pass]),
+    beta_rmse = sqrt(mean(beta_squared_error[full_diagnostic_pass])),
+    beta_coverage_rate_95 = mean(beta_coverage_95[full_diagnostic_pass]),
+    mean_beta_interval_width_95 = mean(beta_interval_width_95[full_diagnostic_pass]),
+    mean_estimated_slope_sd = mean(estimated_slope_sd[full_diagnostic_pass]),
+    slope_sd_relative_bias = (mean_estimated_slope_sd - slope_sd) / slope_sd,
+    slope_sd_coverage = mean(slope_sd_coverage[full_diagnostic_pass]),
+    median_slope_sd_interval_width = median(slope_sd_interval_width[full_diagnostic_pass]),
+    .groups = "drop"
+  ) |>
+  mutate(
+    TPR = if_else(within_slope_mean < 0, strong_negative_evidence_rate, NA_real_),
+    FPR = if_else(within_slope_mean == 0, strong_negative_evidence_rate, NA_real_)
+  )
+
+condition_summary
+
+dir.create("results", showWarnings = FALSE, recursive = TRUE)
+write.csv(
+  simulation_level_results,
+  sprintf("results/bfda_recruitment_missingness_simulation_level_nsim_%d.csv", num_simulations),
+  row.names = FALSE
+)
+write.csv(
+  condition_summary,
+  sprintf("results/bfda_recruitment_missingness_summary_nsim_%d.csv", num_simulations),
+  row.names = FALSE
+)
+```
+
+# 6. Plot evidence rates
+
+```{r plot}
+ggplot(
+  condition_summary,
+  aes(x = scenario, y = strong_negative_evidence_rate, fill = factor(within_slope_mean))
+) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Evidence rate under recruitment and missingness scenarios",
+    x = "Completeness scenario",
+    y = "BF10 >= 10 and posterior mean < 0",
+    fill = "True within slope"
+  ) +
+  theme_bw()
+```
+

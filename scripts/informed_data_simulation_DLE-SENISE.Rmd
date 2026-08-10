@@ -1,0 +1,768 @@
+---
+title: "Informed data simulation for daytime melanopic EDI"
+author: "Taisuke Eto"
+date: "2026-07-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(melidosData)
+```
+
+# Overview
+
+This script identifies plausible parameter combinations for the Bayesian factor design analysis (BFDA). 
+It uses melatonin suppression data from a previous study and daytime melanopic EDI data from the MeliDos dataset.
+
+The simulated model separates daytime melanopic EDI into within-person and
+between-person components:
+
+`outcome ~ edi_within + edi_between + (1 + edi_within | participant)`
+
+The script:
+
+1. prepares and standardises the reference outcome and exposure data;
+2. defines candidate fixed- and random-effect parameters;
+3. simulates repeated-measures datasets;
+4. compares their means and SDs with bootstrap reference intervals; and
+5. saves plausible parameter combinations for the BFDA.
+
+The reference outcome dataset has one observation per participant. 
+It therefore cannot identify random-effect and residual SDs separately. 
+These quantities are screened over prespecified candidate values rather than estimated directly.
+
+# 1. Prepare reference data
+
+## Melatonin suppression and daytime melanopic EDI
+
+```{r import-and-prepare-reference-data}
+# Reference melatonin suppression data
+mlt_data <- read.csv("VR_paper_melatonin_results.csv")
+
+# Summarise the unstandardised outcome
+mlt_raw_data_summary <- mlt_data |>
+  summarise(
+    mean   = mean(mel_supp),
+    sd     = sd(mel_supp),
+    median = median(mel_supp),
+    iqr    = IQR(mel_supp),
+    lower_bound     = quantile(mel_supp, 0.025),
+    upper_bound     = quantile(mel_supp, 0.975)
+  )
+
+
+# MeliDos light-exposure data
+medi_data_raw <- load_data(
+  site = c("BAUA", "MPI", "TUM")
+)
+medi_data_de <- bind_rows(
+  medi_data_raw$BAUA,
+  medi_data_raw$MPI,
+  medi_data_raw$TUM
+)
+
+
+# Sleep diaries define the daytime window
+sleep_data_raw <- load_data(
+  "sleepdiaries", site = c("BAUA", "MPI", "TUM")
+)
+sleep_data_de <- bind_rows(
+  sleep_data_raw$BAUA,
+  sleep_data_raw$MPI,
+  sleep_data_raw$TUM
+)
+
+daytime_window <- sleep_data_de |>
+  arrange(Id, wake) |>
+  group_by(Id) |>
+  mutate(
+    window_start = wake,
+    window_end = lead(bedtime) - hours(7),
+    window_start_date = as_date(window_start),
+    window_end_date = as_date(window_end)
+  ) |>
+  ungroup() |>
+  filter(
+    !is.na(window_start),
+    !is.na(window_end),
+    window_end > window_start,
+    window_start_date == window_end_date
+  ) |>
+  select(Id, bedtime, wake, window_start, window_end, window_start_date)
+
+
+# Match light exposure to the corresponding daytime window
+medi_sleep_data_de <- medi_data_de |>
+  mutate(window_start_date = as_date(Datetime)) |>
+  left_join(daytime_window, by = c("Id", "window_start_date"))
+
+
+# Sum exposure from wake time to seven hours before bedtime
+daytime_medi_de <- medi_sleep_data_de |>
+  filter(!is.na(MEDI)) |>
+  mutate(
+    date = window_start_date,
+    time = hms::as_hms(Datetime),
+    window_start_time = hms::as_hms(window_start),
+    window_end_time = hms::as_hms(window_end)
+  ) |>
+  filter(
+    time >= window_start_time,
+    time <= window_end_time
+  ) |>
+  group_by(Id, date) |>
+  summarise(
+    daytime_medi_dose = sum(MEDI) * (10 / 3600),
+    n_valid = n(),
+    .groups = "drop"
+  ) |>
+  mutate(log_mean_dose = log10(daytime_medi_dose + 0.1))
+
+# Summarise between- and within-person exposure variability
+subject_daytime_stats <- daytime_medi_de |>
+  group_by(Id) |>
+  summarise(
+    mean_dose = mean(daytime_medi_dose, na.rm = TRUE),
+    sd_dose = sd(daytime_medi_dose, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    log_mean_dose_subject = log10(mean_dose + 0.1)
+  )
+
+between_daytime_medi_summary <- subject_daytime_stats |>
+  summarise(
+    mean = mean(mean_dose),
+    sd = sd(mean_dose),
+    min = min(mean_dose),
+    max = max(mean_dose)
+  )
+
+within_daytime_medi_summary <- subject_daytime_stats |>
+  summarise(
+    mean_sd = mean(sd_dose, na.rm = TRUE),
+    sd_sd = sd(sd_dose, na.rm = TRUE),
+    median_sd = median(sd_dose, na.rm = TRUE),
+    iqr_sd = IQR(sd_dose, na.rm = TRUE)
+  )
+
+
+mlt_raw_data_summary
+between_daytime_medi_summary
+within_daytime_medi_summary
+```
+
+## Standardise outcome and exposure
+
+```{r standardise-reference-data}
+mlt_data_standardised <- mlt_data |>
+  mutate(
+    mel_supp_standardised =
+      (mel_supp - mean(mel_supp)) / sd(mel_supp)
+  )
+
+mlt_data_standardised_summary <- mlt_data_standardised |>
+  summarise(
+    mean   = mean(mel_supp_standardised),
+    sd     = sd(mel_supp_standardised),
+    median = median(mel_supp_standardised),
+    lower_bound     = quantile(mel_supp_standardised, 0.025),
+    upper_bound     = quantile(mel_supp_standardised, 0.975)
+  )
+
+medi_data_standardised <- daytime_medi_de |>
+  filter(is.finite(log_mean_dose)) |>
+  mutate(
+    log_mean_dose_standardised =
+      (log_mean_dose - mean(log_mean_dose)) / sd(log_mean_dose)
+  )
+
+medi_data_standardised_summary <- medi_data_standardised |>
+  summarise(
+    mean   = mean(log_mean_dose_standardised),
+    sd     = sd(log_mean_dose_standardised),
+    median = median(log_mean_dose_standardised),
+    lower_bound     = quantile(log_mean_dose_standardised, 0.025),
+    upper_bound     = quantile(log_mean_dose_standardised, 0.975)
+  )
+
+medi_data_standardised_summary
+mlt_data_standardised_summary
+```
+
+# 2. Define candidate parameters
+
+We assign a wide range of possible values to the intercept and slope. 
+We also screen candidate values for the random-intercept, random-slope, and residual SDs, as well as the correlation between the random intercept and random slope.
+These values are assumptions to be checked, rather than variance components estimated from the single-observation reference melatonin dataset.
+
+```{r candidate-parameters}
+# Population intercept values on the standardised scale
+intercept_mean_list <- round(seq(-0.9, 0.9, by = 0.3), 2)
+
+# Population-level within-person slopes on the standardised scale
+within_slope_mean_list <- seq(-0.5, 0.5, by = 0.1)
+
+# The between-person effect is fixed at zero for parameter screening
+between_slope_mean <- 0
+
+# Candidate participant-level and observation-level SDs
+intercept_sd_list <- c(0.1, 0.2, 0.3)
+slope_sd_list <- c(0.1, 0.2, 0.3)
+noise_sd_list <- c(0.3, 0.6, 0.9, 1.0)
+
+# Candidate random intercept-slope correlations
+intercept_slope_correlation_list <- c(-0.5, 0, 0.5)
+
+# Prospective study structure
+n_participants <- 50
+n_sessions <- 3
+
+# Number of complete simulated datasets per parameter combination
+num_simulations <- 100
+
+# Number of bootstrap samples used to define reference intervals
+n_bootstrap <- 5000
+
+# Minimum proportion meeting both reference criteria
+plausibility_threshold <- 0.80
+```
+
+# 3. Define bootstrap reference intervals
+
+Bootstrap 95% intervals are calculated for the mean and SD of the standardised reference outcome.
+
+```{r bootstrap-reference-intervals}
+set.seed(20260731)
+
+reference_z <- mlt_data_standardised$mel_supp_standardised
+n_reference <- length(reference_z)
+
+reference_bootstrap <- replicate(
+  n_bootstrap,
+  {
+    bootstrap_sample <- sample(
+      reference_z,
+      size = n_reference,
+      replace = TRUE
+    )
+
+    c(
+      mean = mean(bootstrap_sample),
+      sd = sd(bootstrap_sample)
+    )
+  }
+) |>
+  t() |>
+  as.data.frame()
+
+reference_intervals <- reference_bootstrap |>
+  summarise(
+    mean_lower = quantile(mean, 0.025),
+    mean_upper = quantile(mean, 0.975),
+    sd_lower = quantile(sd, 0.025),
+    sd_upper = quantile(sd, 0.975)
+  )
+
+reference_intervals
+```
+
+# 4. Define simulation functions
+
+Predictor values are sampled from actual MeliDos participants. 
+For each simulated participant, one MeliDos participant is sampled as a donor and three days are drawn from that donor. 
+This retains more of the observed within- and between-participant exposure structure than drawing from a uniform distribution.
+
+```{r simulation-functions}
+medi_values_by_participant <- split(
+  medi_data_standardised$log_mean_dose_standardised,
+  medi_data_standardised$Id
+)
+
+medi_values_by_participant <- medi_values_by_participant[
+  lengths(medi_values_by_participant) > 0
+]
+
+sample_medi_profile <- function(n_participants, n_sessions) {
+
+  donor_index <- sample.int(
+    length(medi_values_by_participant),
+    size = n_participants,
+    replace = TRUE
+  )
+
+  sampled_values <- map(
+    donor_index,
+    function(index) {
+
+      donor_values <- medi_values_by_participant[[index]]
+
+      donor_values[
+        sample.int(
+          length(donor_values),
+          size = n_sessions,
+          replace = length(donor_values) < n_sessions
+        )
+      ]
+    }
+  )
+
+  sampled_data <- tibble(
+    participant = factor(
+      rep(seq_len(n_participants), each = n_sessions)
+    ),
+    session = rep(
+      seq_len(n_sessions),
+      times = n_participants
+    ),
+    edi_total = unlist(
+      sampled_values,
+      use.names = FALSE
+    )
+  ) |>
+    group_by(participant) |>
+    mutate(
+      # Participant mean across simulated bright-light sessions
+      edi_between_raw = mean(edi_total),
+
+      # Session-specific deviation from that participant's mean
+      edi_within_raw = edi_total - edi_between_raw
+    ) |>
+    ungroup()
+
+  # Standardise within- and between-person components separately
+  between_values <- sampled_data |>
+    distinct(participant, edi_between_raw) |>
+    pull(edi_between_raw)
+
+  between_mean <- mean(between_values)
+  between_sd <- sd(between_values)
+  within_sd <- sd(sampled_data$edi_within_raw)
+
+  if (
+    !is.finite(between_sd) ||
+    !is.finite(within_sd) ||
+    between_sd == 0 ||
+    within_sd == 0
+  ) {
+    stop("Unable to standardise the sampled within/between mEDI components.")
+  }
+
+  sampled_data |>
+    mutate(
+      edi_between =
+        (edi_between_raw - between_mean) / between_sd,
+
+      edi_within =
+        edi_within_raw / within_sd
+    )
+}
+
+
+prepare_simulation_input <- function(
+    n_participants,
+    n_sessions) {
+
+  predictor_data <- sample_medi_profile(
+    n_participants = n_participants,
+    n_sessions = n_sessions
+  )
+
+  list(
+    predictor_data = predictor_data,
+    z_intercept = rnorm(n_participants),
+    z_slope = rnorm(n_participants),
+    z_noise = rnorm(nrow(predictor_data))
+  )
+}
+
+
+simulate_dataset <- function(
+    simulation_input,
+    intercept_mean,
+    within_slope_mean,
+    between_slope_mean,
+    intercept_sd,
+    slope_sd,
+    intercept_slope_correlation,
+    noise_sd) {
+
+  simulated_data <- simulation_input$predictor_data
+  n_participants <- nlevels(simulated_data$participant)
+
+  # Construct correlated standard-normal random effects
+  z_slope_correlated <-
+    intercept_slope_correlation * simulation_input$z_intercept +
+    sqrt(1 - intercept_slope_correlation^2) *
+      simulation_input$z_slope
+
+  # Participant-specific random intercept
+  participant_intercept <-
+    intercept_mean +
+    intercept_sd * simulation_input$z_intercept
+
+  # Participant-specific slope for the within-participant predictor
+  participant_within_slope <-
+    within_slope_mean +
+    slope_sd * z_slope_correlated
+
+  participant_index <- as.integer(
+    simulated_data$participant
+  )
+
+  simulated_data |>
+    mutate(
+      intercept =
+        participant_intercept[participant_index],
+
+      within_slope =
+        participant_within_slope[participant_index],
+
+      noise =
+        noise_sd * simulation_input$z_noise,
+
+      y =
+        intercept +
+        between_slope_mean * edi_between +
+        within_slope * edi_within +
+        noise
+    )
+}
+```
+
+# 5. Screen parameter combinations
+
+```{r run-parameter-screening}
+set.seed(20260405)
+
+simulation_time <- system.time({
+
+# Reuse common random draws across parameter combinations
+simulation_inputs <- map(
+  seq_len(num_simulations),
+  ~ prepare_simulation_input(
+    n_participants = n_participants,
+    n_sessions = n_sessions
+  )
+)
+
+simulation_result_list <- list()
+result_index <- 1
+
+for (intercept_mean in intercept_mean_list) {
+  for (within_slope_mean in within_slope_mean_list) {
+    for (intercept_sd in intercept_sd_list) {
+      for (slope_sd in slope_sd_list) {
+        for (intercept_slope_correlation in
+             intercept_slope_correlation_list) {
+          for (noise_sd in noise_sd_list) {
+
+            # Store one row for each complete simulated dataset
+            combination_results <- vector(
+              mode = "list",
+              length = num_simulations
+            )
+
+            for (simulation in seq_len(num_simulations)) {
+
+              simulated_data <- simulate_dataset(
+                simulation_input = simulation_inputs[[simulation]],
+                intercept_mean = intercept_mean,
+                within_slope_mean = within_slope_mean,
+                between_slope_mean = between_slope_mean,
+                intercept_sd = intercept_sd,
+                slope_sd = slope_sd,
+                intercept_slope_correlation =
+                  intercept_slope_correlation,
+                noise_sd = noise_sd
+              )
+
+              combination_results[[simulation]] <- tibble(
+                simulation = simulation,
+                mean_y = mean(simulated_data$y),
+                sd_y = sd(simulated_data$y),
+                q025_y = quantile(simulated_data$y, 0.025),
+                q975_y = quantile(simulated_data$y, 0.975)
+              )
+            }
+
+            combination_results <- bind_rows(combination_results) |>
+              mutate(
+                mean_plausible =
+                  mean_y >= reference_intervals$mean_lower &
+                  mean_y <= reference_intervals$mean_upper,
+                sd_plausible =
+                  sd_y >= reference_intervals$sd_lower &
+                  sd_y <= reference_intervals$sd_upper,
+                jointly_plausible = mean_plausible & sd_plausible
+              )
+
+            simulation_result_list[[result_index]] <-
+              combination_results |>
+              summarise(
+                intercept_mean = intercept_mean,
+                within_slope_mean = within_slope_mean,
+                between_slope_mean = between_slope_mean,
+                intercept_sd = intercept_sd,
+                slope_sd = slope_sd,
+                intercept_slope_correlation =
+                  intercept_slope_correlation,
+                noise_sd = noise_sd,
+                mean_y = mean(mean_y),
+                sd_y = mean(sd_y),
+                mean_q025_y = mean(q025_y),
+                mean_q975_y = mean(q975_y),
+                mean_acceptance_rate = mean(mean_plausible),
+                sd_acceptance_rate = mean(sd_plausible),
+                joint_acceptance_rate = mean(jointly_plausible),
+                accepted = if_else(
+                  joint_acceptance_rate >= plausibility_threshold,
+                  "yes",
+                  "no"
+                )
+              )
+
+            result_index <- result_index + 1
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
+simulated_data_results <- bind_rows(simulation_result_list) |>
+  mutate(accepted = factor(accepted, levels = c("no", "yes")))
+
+# Keep only accepted parameter combinations
+accepted_params <- simulated_data_results |>
+  filter(accepted == "yes")
+
+# Summary of accepted parameters
+accepted_params_summary <- accepted_params |>
+  summarise(
+    n_accepted = n(),
+    min_intercept = min(intercept_mean),
+    max_intercept = max(intercept_mean),
+    min_edi = min(within_slope_mean),
+    median_edi = median(within_slope_mean),
+    max_edi = max(within_slope_mean),
+    min_intercept_sd = min(intercept_sd),
+    max_intercept_sd = max(intercept_sd),
+    min_slope_sd = min(slope_sd),
+    max_slope_sd = max(slope_sd),
+    min_intercept_slope_correlation =
+      min(intercept_slope_correlation),
+    max_intercept_slope_correlation =
+      max(intercept_slope_correlation),
+    min_noise_sd = min(noise_sd),
+    max_noise_sd = max(noise_sd)
+  )
+
+})
+
+simulation_time
+
+accepted_params_summary
+```
+
+
+# 6. Review screening results
+
+## Fixed effects
+
+```{r plot-fixed-effect-acceptance}
+fixed_effect_acceptance_summary <- simulated_data_results |>
+  group_by(
+    intercept_mean,
+    within_slope_mean,
+    noise_sd
+  ) |>
+  summarise(
+    proportion_random_effect_structures_accepted =
+      mean(accepted == "yes"),
+    .groups = "drop"
+  )
+
+ggplot(
+  fixed_effect_acceptance_summary,
+  aes(
+    x = factor(intercept_mean),
+    y = factor(within_slope_mean),
+    fill = proportion_random_effect_structures_accepted
+  )
+) +
+  geom_tile(color = "grey85", linewidth = 0.25) +
+  facet_wrap(
+    vars(noise_sd),
+    ncol = 2,
+    labeller = label_both
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "darkgreen",
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.25),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    title = "Acceptance of fixed-effect parameter combinations",
+    subtitle = paste0(
+      "Cell colour: proportion of 27 random-effect structures accepted; ",
+      "joint plausibility threshold = ",
+      scales::percent(plausibility_threshold, accuracy = 1)
+    ),
+    x = "Population intercept mean",
+    y = "Population daytime melanopic EDI slope mean",
+    fill = "Structures\naccepted"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+```
+
+## Variance components
+
+```{r plot-variance-component-acceptance}
+sd_acceptance_summary <- simulated_data_results |>
+  group_by(
+    intercept_sd,
+    slope_sd,
+    intercept_slope_correlation,
+    noise_sd
+  ) |>
+  summarise(
+    mean_joint_acceptance_rate = mean(joint_acceptance_rate),
+    proportion_parameter_sets_accepted = mean(accepted == "yes"),
+    .groups = "drop"
+  )
+
+ggplot(
+  sd_acceptance_summary,
+  aes(
+    x = factor(noise_sd),
+    y = mean_joint_acceptance_rate,
+    group = factor(intercept_slope_correlation),
+    color = factor(intercept_slope_correlation)
+  )
+) +
+  geom_line() +
+  geom_point(size = 2) +
+  facet_grid(
+    rows = vars(intercept_sd),
+    cols = vars(slope_sd),
+    labeller = label_both
+  ) +
+  labs(
+    title = "Plausibility of candidate variance components",
+    x = "Residual SD",
+    y = "Mean joint acceptance rate",
+    color = "Intercept–slope correlation"
+  ) +
+  theme_bw()
+```
+
+## Selected variance components
+
+This check makes the consequence of the selected SD values explicit. 
+
+```{r inspect-selected-parameters}
+selected_parameter_check <- simulated_data_results |>
+  filter(
+    intercept_sd == 0.2,
+    slope_sd == 0.2,
+    intercept_slope_correlation == 0.0,
+    noise_sd == 0.6,
+    intercept_mean %in% c(-0.9, -0.6, -0.3, 0, 0.3, 0.6, 0.9)
+  )
+
+ggplot(
+  selected_parameter_check,
+  aes(
+    x = within_slope_mean,
+    y = joint_acceptance_rate,
+    group = factor(intercept_mean),
+    colour = factor(intercept_mean)
+  )
+) +
+  geom_hline(
+    yintercept = plausibility_threshold,
+    linetype = "dashed",
+    colour = "grey40"
+  ) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    aes(shape = accepted),
+    size = 3
+  ) +
+  scale_x_continuous(
+    breaks = seq(-0.5, 0.5, by = 0.1)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.2),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    title = "Acceptance rates for the selected simulation parameters",
+    subtitle = paste0(
+      "Random-intercept SD = 0.2; random-slope SD = 0.2; ",
+      "correlation = 0; residual SD = 0.6"
+    ),
+    x = "Population slope mean",
+    y = "Joint acceptance rate",
+    colour = "Population\nintercept mean",
+    shape = "Accepted"
+  ) +
+  theme_bw()
+```
+
+# 7. Create and save BFDA inputs
+
+```{r create-informed-parameters}
+informed_parameters <- accepted_params |> 
+  distinct(
+    intercept_mean,
+    within_slope_mean,
+    between_slope_mean
+  ) |> 
+  arrange(
+    intercept_mean,
+    within_slope_mean,
+    between_slope_mean
+  )
+
+informed_parameters
+```
+
+
+The main BFDA input is `informed_parameters.csv`. The complete screening results and standardised mEDI data are also saved for reproducibility.
+
+```{r save-outputs}
+write.csv(
+  informed_parameters,
+  "informed_parameters.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  simulated_data_results,
+  "informed_parameter_screening_all_results.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  medi_data_standardised,
+  "medi_data_standardised.csv",
+  row.names = FALSE
+)
+```
