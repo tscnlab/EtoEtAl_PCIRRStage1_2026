@@ -1,5 +1,5 @@
 ---
-title: "Bayes factor design analysis for daytime mEDI"
+title: "bfda_simulations_parallelised_DLE-SENSE"
 author: "Taisuke Eto"
 date: "2026-07-30"
 output: html_document

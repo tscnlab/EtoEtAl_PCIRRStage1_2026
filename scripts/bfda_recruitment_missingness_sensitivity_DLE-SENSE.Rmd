@@ -1,5 +1,5 @@
 ---
-title: "BFDA recruitment and incomplete-data sensitivity analysis"
+title: "bfda_recruitment_missingness_sensitivity_DLE-SENSE"
 author: "Taisuke Eto"
 date: "2026-08-07"
 output: html_document

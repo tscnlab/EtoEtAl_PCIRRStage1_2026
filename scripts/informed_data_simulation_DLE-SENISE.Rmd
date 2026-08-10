@@ -1,5 +1,5 @@
 ---
-title: "Informed data simulation for daytime melanopic EDI"
+title: "informed_data_simulation_DLE-SENSE"
 author: "Taisuke Eto"
 date: "2026-07-31"
 output: html_document
