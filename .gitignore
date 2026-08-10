@@ -1,0 +1,16 @@
+# R / RStudio
+.Rhistory
+.RData
+.RDataTmp*
+.Rproj.user/
+*.Rproj
+
+# Output files
+*.html
+*.png
+*.txt
+
+# Data files
+*.xlsx
+*.rds
+.positai
