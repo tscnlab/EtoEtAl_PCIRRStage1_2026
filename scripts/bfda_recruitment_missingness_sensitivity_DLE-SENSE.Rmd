@@ -51,7 +51,7 @@ completeness_scenarios <- list(
   stress = c(`3` = 0.70, `2` = 0.20, `1` = 0.10)
 )
 
-num_simulations <- 100  # use a small value for testing
+num_simulations <- 100
 bf_threshold <- 10
 
 intercept_sd <- 0.2

@@ -75,7 +75,7 @@ plan(multisession, workers = workers)
 
 
 # Load the standardised log-transformed daytime mEDI dose data
-medi_dose_data <- read.csv("medi_data_log_transformed.csv") |>
+medi_dose_data <- read.csv("medi_data_standardised.csv") |>
   filter(
     is.finite(log_mean_dose)
   )
@@ -1185,7 +1185,7 @@ head(bfda_simulated_data_parallel)
 
 # Summarise retries and random-slope recovery by generating condition.
 bfda_simulated_data_parallel |>
-  select(
+  dplyr::select(
     within_slope_mean,
     null_initial_diagnostic_pass_rate,
     null_retry_rate,
@@ -1229,15 +1229,6 @@ end_time <- Sys.time()
 start_time
 end_time - start_time
 ```
-
-The main output columns are:
-
-- `null_initial_diagnostic_pass_rate` is the success rate with the original 4,000-iteration setting.
-- `null_retry_rate` is the proportion that required the longer 8,000-iteration refit.
-- `null_retry_rescue_rate` is the proportion of retried Null fits that passed after the longer run.
-- `null_diagnostic_pass_rate` is the final rate after retry and is the rate used for the Bayes-factor analysis.
-- `random_slope_recovery_pass` evaluates the three-observation design for each population-slope condition using the pre-specified valid-fit, relative-bias, coverage, interval-width, and near-zero-collapse criteria.
-- `all_conditions_pass` is `TRUE` only when random-slope recovery passes under every simulated population-slope condition. The component metrics should be reported alongside this binary summary.
 
 # 5. Save results
 
