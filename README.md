@@ -1,9 +1,11 @@
-# DLE-SENSE Registered Report: Stage 1 simulation code and outcomes
-This repository contains the simulation code and outcomes for the Stage 1.
+# DLE-SENSE Registered Report: Stage 1 manuscript and simulation code / outcomes
+This repository contains the manuscript and simulation code / outcomes for the Stage 1.
 
 The simulations were conducted to inform the planned sample size and to assess the analysis of the association between daytime melanopic equivalent daylight illuminance (EDI) dose and evening melatonin suppression.
 
 # Contents
+The `manuscript` folder contains manuscript files (.docx and .pdf)
+
 The `scripts` folder contains three R Markdown Files:
 
 1. `informed_data_simulation_DLE-SENSE.Rmd`
